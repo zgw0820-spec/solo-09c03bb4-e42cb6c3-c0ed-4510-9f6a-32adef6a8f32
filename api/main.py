@@ -2,6 +2,8 @@
 
 Open /docs (Swagger UI) and use GET /query or GET /scenario/{name} to send
 live UDP queries through the DNS64 server and inspect the parsed answers.
+GET /compare/{name} runs the same query against a second DNS64 instance with
+speculative A prefetch enabled and reports both elapsed times.
 """
 
 from __future__ import annotations
@@ -15,6 +17,9 @@ from fastapi import FastAPI, HTTPException, Query
 
 DNS64_HOST = os.environ.get("DNS64_HOST", "127.0.0.1")
 DNS64_PORT = int(os.environ.get("DNS64_PORT", "5354"))
+# Second DNS64 instance with speculative prefetch enabled, used by /compare.
+DNS64_PREFETCH_HOST = os.environ.get("DNS64_PREFETCH_HOST", DNS64_HOST)
+DNS64_PREFETCH_PORT = int(os.environ.get("DNS64_PREFETCH_PORT", "5355"))
 
 # One-click demo scenarios against the scripted sample upstream.
 SCENARIOS = {
@@ -26,6 +31,9 @@ SCENARIOS = {
     "slow": ("slow.example.", "AAAA — A reply arrives after the negative TTL expired -> SERVFAIL"),
     "flap": ("flap.example.", "AAAA — the two upstream replies alias to different endpoints -> SERVFAIL"),
     "multi": ("multi.example.", "AAAA — two A records, TTL = min of all bases"),
+    "slowaaaa": ("slowaaaa.example.", "AAAA — slow AAAA reply; prefetched A query overlaps it"),
+    "dropa": ("dropa.example.", "AAAA — A reply never arrives before the shared deadline -> SERVFAIL"),
+    "prefetchflap": ("prefetchflap.example.", "AAAA — prefetched A aliases elsewhere; fallback A query decides"),
     "timeout": ("drop.example.", "AAAA — upstream never answers -> SERVFAIL"),
 }
 
@@ -72,6 +80,7 @@ def index() -> dict:
     return {
         "service": "dns64-query-console",
         "dns64_server": f"{DNS64_HOST}:{DNS64_PORT}",
+        "dns64_prefetch_server": f"{DNS64_PREFETCH_HOST}:{DNS64_PREFETCH_PORT}",
         "swagger_ui": "/docs",
         "scenarios": sorted(SCENARIOS),
     }
@@ -105,6 +114,55 @@ def scenario(scenario: str) -> dict:
     result = run_query(name, "AAAA", DNS64_HOST, DNS64_PORT, timeout=8.0)
     result["scenario"] = {"name": scenario, "expect": description}
     return result
+
+
+@app.get("/compare/{scenario}",
+         summary="Run the same scenario against the serial and prefetch DNS64")
+def compare(scenario: str, repeat: int = Query(3, ge=1, le=10,
+                                               description="Queries per server; min is reported")):
+    """Compare wall-clock time with and without speculative A prefetch.
+
+    Both servers use the same scripted upstream; only the second one prefetches
+    A for names on its list.  ``min_elapsed_ms`` over ``repeat`` runs removes
+    most of the scheduling noise.
+    """
+    if scenario not in SCENARIOS:
+        raise HTTPException(status_code=404,
+                            detail=f"unknown scenario; try one of {sorted(SCENARIOS)}")
+    name, description = SCENARIOS[scenario]
+
+    def one(target_host, target_port):
+        runs = []
+        result = None
+        for _ in range(repeat):
+            result = run_query(name, "AAAA", target_host, target_port, timeout=8.0)
+            runs.append(result["elapsed_ms"])
+        return {
+            "server": f"{target_host}:{target_port}",
+            "rcode": result["rcode"],
+            "answer": result["answer"],
+            "authority": result["authority"],
+            "elapsed_ms_runs": runs,
+            "min_elapsed_ms": min(runs),
+        }
+
+    serial = one(DNS64_HOST, DNS64_PORT)
+    prefetch = one(DNS64_PREFETCH_HOST, DNS64_PREFETCH_PORT)
+
+    def answer_of(result):
+        return {"rcode": result["rcode"],
+                "answer": [{k: v for k, v in rr.items() if k != "ttl"}
+                           for rr in result["answer"]]}
+
+    return {
+        "scenario": {"name": scenario, "name_fqdn": name, "expect": description},
+        "serial": serial,
+        "prefetch": prefetch,
+        "saved_ms": round(serial["min_elapsed_ms"] - prefetch["min_elapsed_ms"], 1),
+        # TTLs are expected to differ slightly (the prefetched A reply arrived
+        # earlier), so comparison ignores them.
+        "same_answer": answer_of(serial) == answer_of(prefetch),
+    }
 
 
 def main() -> None:

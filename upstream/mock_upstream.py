@@ -14,6 +14,9 @@ noaddr.example.         NODATA (neg-ttl 20)                               NODATA
 slow.example.           NODATA (neg-ttl 1)                                A 192.0.2.20 (ttl 60) after 1.5s delay
 flap.example.           CNAME ep-a.example. + NODATA                      CNAME ep-b.example. + A 192.0.2.30
 multi.example.          NODATA (neg-ttl 30)                               A 192.0.2.41 (ttl 120) + A 192.0.2.42 (ttl 25)
+slowaaaa.example.       NODATA (neg-ttl 30) after 1.5s                    A 192.0.2.25 (ttl 60) after 1.5s
+dropa.example.          NODATA (neg-ttl 30)                               A 192.0.2.26 after 5s (past the deadline)
+prefetchflap.example.   CNAME ep-a.example. + NODATA                      CNAME ep-b.example. + A 192.0.2.31
 drop.example.           no response (client times out)                    no response
 ======================  ================================================  ==========================================
 """
@@ -58,6 +61,7 @@ class Behaviour:
     nxdomain: bool = False
     neg_ttl: int = 30                                  # negative TTL of NODATA replies
     delay: float = 0.0                                 # seconds to wait before answering
+    a_delay: float = 0.0                               # same, only for A queries
     drop: bool = False                                 # never answer (client times out)
 
 
@@ -81,7 +85,7 @@ ZONE_FILE = {
     "slow.example.": Behaviour(
         a_records=[("192.0.2.20", 60)],
         neg_ttl=1,          # negative cache lifetime of the no-AAAA answer
-        delay=1.5,          # ... but the A reply arrives 1.5s later -> expired
+        a_delay=1.5,        # ... but the A reply arrives 1.5s later -> expired
     ),
     "flap.example.": Behaviour(
         cname_for_aaaa="ep-a.example.",   # the two queries see different
@@ -92,6 +96,23 @@ ZONE_FILE = {
     ),
     "multi.example.": Behaviour(
         a_records=[("192.0.2.41", 120), ("192.0.2.42", 25)],
+        neg_ttl=30,
+    ),
+    "slowaaaa.example.": Behaviour(
+        a_records=[("192.0.2.25", 60)],
+        neg_ttl=30,
+        delay=1.5,          # both replies are delayed; overlaps the A query
+    ),
+    "dropa.example.": Behaviour(
+        a_records=[("192.0.2.26", 60)],
+        neg_ttl=30,
+        a_delay=5.0,        # A answer never arrives before the deadline
+    ),
+    "prefetchflap.example.": Behaviour(
+        cname_for_aaaa="ep-a.example.",   # the two queries see different
+        cname_for_a="ep-b.example.",      # alias endpoints -> prefetch unusable
+        cname_ttl=40,
+        a_records=[("192.0.2.31", 60)],
         neg_ttl=30,
     ),
     "drop.example.": Behaviour(drop=True),
@@ -117,12 +138,13 @@ class ScriptedResolver(BaseResolver):
             log.info("%s %s: dropping (no response)", qname, qtype)
             time.sleep(10)  # longer than any client timeout
             return reply
-        if behaviour.delay and qtype == "A":
-            # The A reply arrives late (the AAAA reply is not delayed), so
-            # the negative-caching window of the no-AAAA answer can expire
-            # before the synthesis basis is complete.
-            log.info("%s %s: delaying answer by %.1fs", qname, qtype, behaviour.delay)
-            time.sleep(behaviour.delay)
+        query_delay = behaviour.a_delay if qtype == "A" else 0.0
+        total_delay = behaviour.delay + query_delay
+        if total_delay:
+            # A delayed A reply arrives after the negative-caching window of
+            # the no-AAAA answer, or after the client's A-query deadline.
+            log.info("%s %s: delaying answer by %.1fs", qname, qtype, total_delay)
+            time.sleep(total_delay)
         if behaviour.nxdomain:
             reply.header.rcode = RCODE.NXDOMAIN
             reply.add_auth(soa(behaviour.neg_ttl))
