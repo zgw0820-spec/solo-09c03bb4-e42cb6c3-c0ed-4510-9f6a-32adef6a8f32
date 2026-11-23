@@ -1,0 +1,43 @@
+services:
+  upstream:
+    build: ./upstream
+    container_name: dns64-sample-upstream
+    expose:
+      - "5353/udp"
+    networks:
+      - dns64net
+
+  dns64:
+    build: ./dns64
+    container_name: dns64-server
+    environment:
+      UPSTREAM_HOST: upstream
+      UPSTREAM_PORT: "5353"
+      DNS64_PREFIX: "64:ff9b::/96"
+      UPSTREAM_TIMEOUT: "2.0"
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "5354"
+    ports:
+      - "5354:5354/udp"
+    depends_on:
+      - upstream
+    networks:
+      - dns64net
+
+  api:
+    build: ./api
+    container_name: dns64-query-console
+    environment:
+      DNS64_HOST: dns64
+      DNS64_PORT: "5354"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - dns64
+    networks:
+      - dns64net
+
+networks:
+  dns64net:
+    driver: bridge
